@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Neopets Scarab 21 Helper
 // @namespace    GreaseMonkey
-// @version      1.0
+// @version      2.0
 // @description  Highlights the recommended column for Scarab 21 using the Balanced Target-11 strategy. No automated actions.
 // @author       @willnjohnson
 // @match        https://www.neopets.com/games/scarab21/scarab21.phtml*
