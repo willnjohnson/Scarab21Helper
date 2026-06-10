@@ -1,55 +1,29 @@
 // ==UserScript==
 // @name         Neopets Scarab 21 Autoplayer
 // @namespace    GreaseMonkey
-// @version      1.0
-// @description  Automates Scarab 21.
+// @version      2.0
+// @description  Automates Scarab 21 using Balanced Target-11 strategy.
 // @author       @willnjohnson
 // @match        https://www.neopets.com/games/scarab21/index.phtml
 // @match        https://www.neopets.com/games/scarab21/scarab21.phtml*
 // @grant        none
 // ==/UserScript==
 
-/*
-  This script uses a domain-specific greedy heuristic designed for the
-  Neopets game "Scarab 21". It does NOT attempt to predict future cards (count cards)
-  or explore all possible outcomes — instead, it makes each move based
-  solely on the current board state with the aim of maximizing points
-  as early as possible.
-
-  Decision priority:
-    1. Place the drawn card in any column that will immediately total 21.
-    2. Special handling for Aces (1/11) and 10-value cards (10/J/Q/K):
-         - Try to pair with complementary totals (e.g., 10 + Ace, Ace + 10).
-         - Favor columns close to 21 without busting.
-         - Avoid "trap" totals that limit future moves unless beneficial.
-    3. If no immediate 21, choose a column that:
-         - Keeps the total ≤ 21,
-         - Is as high as possible without busting,
-         - Prefers non-empty columns over empty ones in mid/late game.
-    4. Final fallback: first available legal column.
-
-  Key characteristics:
-    - Greedy: always aims for the highest immediate gain.
-    - Deterministic: given the same board and card, will make the same choice.
-    - No lookahead: does not simulate future draws.
-    - Strategy goal: build 21s early to maximize points and free up columns.
-*/
-
 (function () {
   "use strict";
 
-  // --- Configuration ---
+  // CONFIG
   const CONFIG = {
-    minActionDelayMs: 700,
-    maxActionDelayMs: 1450,
-    minNavigationDelayMs: 1000,
-    maxNavigationDelayMs: 2000,
-    initialLoadDelayMs: 1200,
-    gameBaseUrl: "https://www.neopets.com/games/scarab21/",
+    minActionDelayMs: 600,
+    maxActionDelayMs: 920,
+    minNavigationDelayMs: 850,
+    maxNavigationDelayMs: 1200,
+    initialLoadDelayMs: 1100,
     playGameUrl: "https://www.neopets.com/games/scarab21/scarab21.phtml",
-    autoplayStorageKey: "scarab21_autoplay_enabled",
+    homeUrl: "https://www.neopets.com/games/scarab21/index.phtml",
     highlightColor: "magenta",
     highlightThickness: "4px",
+    overlayZIndex: 9998,
     keybinds: {
       KeyZ: 0,
       KeyX: 1,
@@ -57,118 +31,249 @@
       KeyV: 3,
       KeyB: 4,
     },
-    overlayColor: "rgba(0, 0, 0, 0.5)",
-    overlayZIndex: 9998,
   };
 
-  // --- Utility Functions ---
+  // DECISION ENGINE
+  const ROLLOUTS = 300;
+
+  /** Returns the best sum of a column's card values, treating aces optimally. */
+  function calcFastSum(cards) {
+    let sum = 0;
+    let aces = 0;
+    for (const v of cards) {
+      sum += v;
+      if (v === 1) aces++;
+    }
+    while (aces > 0 && sum + 10 <= 21) {
+      sum += 10;
+      aces--;
+    }
+    return sum;
+  }
+
+  function fastCanPlace(cards, cardVal) {
+    return calcFastSum(cards) + cardVal <= 21;
+  }
+
+  /**
+   * Evaluates a column after a card has been placed.
+   * Mutates `sizes` to 0 if the column is cleared (scored).
+   * Returns the points earned (0 if column not yet complete).
+   */
+  function evaluateFastColumn(sizes, values, colIdx) {
+    const sum = calcFastSum(values[colIdx].slice(0, sizes[colIdx]));
+    const size = sizes[colIdx];
+    if (sum === 21) {
+      sizes[colIdx] = 0;
+      return size >= 4 ? 15 : 10;
+    }
+    if (size === 5) {
+      sizes[colIdx] = 0;
+      return 5;
+    }
+    return 0;
+  }
+
+  /**
+   * Simulates one full game playout starting after placing `currentCardVal`
+   * into column `startingCol`.  Uses a pre-shuffled pool of remaining cards.
+   */
+  function simulateFastPlayout(startingCol, currentCardVal, pool, sizes, values) {
+    // Fisher-Yates shuffle of pool
+    for (let i = pool.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      const tmp = pool[i];
+      pool[i] = pool[j];
+      pool[j] = tmp;
+    }
+
+    // Place the drawn card into the chosen column
+    values[startingCol][sizes[startingCol]] = currentCardVal;
+    sizes[startingCol]++;
+    let score = evaluateFastColumn(sizes, values, startingCol);
+
+    // Simulate the rest of the deck
+    for (const cardVal of pool) {
+      let bestMove = -1;
+      let bestWeight = -Infinity;
+
+      for (let col = 0; col < 5; col++) {
+        const colCards = values[col].slice(0, sizes[col]);
+        if (!fastCanPlace(colCards, cardVal)) continue;
+
+        const currentSum = calcFastSum(colCards);
+        const nextSum = currentSum + cardVal;
+        const currentSize = sizes[col];
+        let moveWeight = 0;
+
+        if (nextSum === 11) moveWeight += 260;
+        if (cardVal === 10 && (currentSum === 11 || (currentSize === 1 && values[col][0] === 1))) moveWeight += 350;
+        if (cardVal === 10 && currentSum === 10) moveWeight -= 120;
+        if (currentSum === 11 && cardVal !== 10) moveWeight -= 100;
+        if (nextSum === 21) moveWeight += 150;
+        if (currentSize + 1 === 5) moveWeight += 60;
+        if (nextSum >= 12 && nextSum <= 16) moveWeight -= 40;
+
+        if (moveWeight > bestWeight) {
+          bestWeight = moveWeight;
+          bestMove = col;
+        }
+      }
+
+      if (bestMove === -1) break;
+
+      values[bestMove][sizes[bestMove]] = cardVal;
+      sizes[bestMove]++;
+      score += evaluateFastColumn(sizes, values, bestMove);
+    }
+
+    return score;
+  }
+
+  /**
+   * Runs ROLLOUTS simulations for placing `drawnValue` in `chosenCol` and
+   * returns the average score.
+   */
+  function simulateAverageScore(chosenCol, drawnValue, masterPool, baseSizes, baseValues) {
+    let totalScore = 0;
+
+    for (let rollout = 0; rollout < ROLLOUTS; rollout++) {
+      // Deep-copy state for this rollout
+      const pool = masterPool.slice();
+      const sizes = baseSizes.slice();
+      const values = baseValues.map((col) => col.slice());
+
+      totalScore += simulateFastPlayout(chosenCol, drawnValue, pool, sizes, values);
+    }
+
+    return totalScore / ROLLOUTS;
+  }
+
+  /**
+   * Builds remaining-deck counts after removing all placed cards and the
+   * drawn card.  Returns a flat array of individual card math values.
+   */
+  function buildMasterPool(columns, drawnMath) {
+    // Standard 52-card deck: 4 copies of 1-9, 16 copies of 10 (10/J/Q/K)
+    const counts = new Array(11).fill(4);
+    counts[10] = 16;
+
+    for (const col of columns) {
+      for (const card of col) {
+        counts[card.math]--;
+      }
+    }
+    counts[drawnMath]--;
+
+    const pool = [];
+    for (let v = 1; v <= 10; v++) {
+      const n = Math.max(0, counts[v]);
+      for (let i = 0; i < n; i++) pool.push(v);
+    }
+    return pool;
+  }
+
+  /**
+   * Main entry point
+   * @param {{ math: number }} drawnCard
+   * @param {Array<Array<{ math: number }>>} columns  – 5-element array of card arrays
+   * @returns {number} 1-based column index (1–5), or -1 if no legal move exists
+   */
+  function chooseColumn(drawnCard, columns) {
+    const masterPool = buildMasterPool(columns, drawnCard.math);
+
+    // Snapshot current board as plain int arrays for fast simulation
+    const baseSizes = columns.map((col) => col.length);
+    const baseValues = columns.map((col) => {
+      const arr = new Array(6).fill(0);
+      col.forEach((c, i) => (arr[i] = c.math));
+      return arr;
+    });
+
+    let bestIndex = -1;
+    let bestScore = -Infinity;
+
+    for (let i = 0; i < 5; i++) {
+      // Check whether this column can legally receive the drawn card
+      if (!fastCanPlace(baseValues[i].slice(0, baseSizes[i]), drawnCard.math)) continue;
+
+      const avgScore = simulateAverageScore(i, drawnCard.math, masterPool, baseSizes, baseValues);
+      if (avgScore > bestScore) {
+        bestScore = avgScore;
+        bestIndex = i;
+      }
+    }
+
+    return bestIndex === -1 ? -1 : bestIndex + 1; // convert to 1-based
+  }
+
+  // UTILITIES
   const pauseExecution = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
   const getElement = (selector, context = document) => {
-    try {
-      return context.querySelector(selector);
-    } catch (e) {
-      return null;
-    }
+    try { return context.querySelector(selector); } catch { return null; }
   };
+
   const getAllElements = (selector, context = document) => {
-    try {
-      return context.querySelectorAll(selector);
-    } catch (e) {
-      return [];
-    }
+    try { return context.querySelectorAll(selector); } catch { return []; }
   };
-  const elementExists = (selector, context = document) => !!getElement(selector, context);
-  const getRandomDelay = () => Math.floor(Math.random() * (CONFIG.maxActionDelayMs - CONFIG.minActionDelayMs + 1)) + CONFIG.minActionDelayMs;
-  const getRandomNavigationDelay = () => Math.floor(Math.random() * (CONFIG.maxNavigationDelayMs - CONFIG.minNavigationDelayMs + 1)) + CONFIG.minNavigationDelayMs;
+
+  const getRandomDelay = () =>
+    Math.floor(Math.random() * (CONFIG.maxActionDelayMs - CONFIG.minActionDelayMs + 1)) + CONFIG.minActionDelayMs;
+
+  const getRandomNavigationDelay = () =>
+    Math.floor(Math.random() * (CONFIG.maxNavigationDelayMs - CONFIG.minNavigationDelayMs + 1)) + CONFIG.minNavigationDelayMs;
+
   async function reloadPage() {
     await pauseExecution(getRandomNavigationDelay());
-    window.location.replace("https://www.neopets.com/games/scarab21/scarab21.phtml");
+    window.location.replace(CONFIG.playGameUrl);
   }
+
   async function goBack() {
     await pauseExecution(getRandomNavigationDelay());
     window.history.back();
   }
 
-  // --- Local Storage ---
-  const getAutoplaySetting = () => {
-    const setting = localStorage.getItem(CONFIG.autoplayStorageKey);
-    return setting === null ? true : setting === "true";
-  };
-  const setAutoplaySetting = (enabled) => {
-    localStorage.setItem(CONFIG.autoplayStorageKey, enabled.toString());
-  };
-
-  // --- UI Elements ---
-  let autoplayToggleBtn, manualPlayModal, manualPlayNextBtn, manualPlayMessage, currentHighlightedElement = null;
+  // COLUMN OVERLAYS
   let columnOverlays = [];
 
-  function createAutoplayToggleButton() {
-    autoplayToggleBtn = document.createElement("button");
-    autoplayToggleBtn.style.cssText = `position: fixed; top: 10px; right: 10px; z-index: 10000; background-color: #333; color: white; border: 1px solid #555; padding: 8px 12px; cursor: pointer; font-size: 14px; border-radius: 5px; opacity: 0.8; transition: opacity 0.3s;`;
-    autoplayToggleBtn.onmouseover = () => (autoplayToggleBtn.style.opacity = "1");
-    autoplayToggleBtn.onmouseout = () => (autoplayToggleBtn.style.opacity = "0.8");
-    updateAutoplayButtonText();
-    autoplayToggleBtn.onclick = () => {
-      const currentSetting = getAutoplaySetting();
-      setAutoplaySetting(!currentSetting);
-      updateAutoplayButtonText();
-      if (!currentSetting) {
-        hideManualPlayModal();
-      }
-      window.location.reload();
-    };
-    document.body.appendChild(autoplayToggleBtn);
-  }
-
-  function updateAutoplayButtonText() {
-    if (!autoplayToggleBtn) return;
-    const enabled = getAutoplaySetting();
-    autoplayToggleBtn.textContent = `Autoplay: ${enabled ? "ON" : "OFF"}`;
-    autoplayToggleBtn.style.backgroundColor = enabled ? "#28a745" : "#dc3545";
-  }
-
-  function createManualPlayModal() {
-    manualPlayModal = document.createElement("div");
-    manualPlayModal.id = "scarab21-manual-modal";
-    manualPlayModal.style.cssText = `position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); z-index: 9999; background-color: #333; color: white; border: 2px solid #555; padding: 15px 20px; border-radius: 8px; box-shadow: 0 4px 8px rgba(0, 0, 0, 0.2); font-family: sans-serif; display: none; align-items: center; gap: 15px; min-width: 250px;`;
-    manualPlayMessage = document.createElement("span");
-    manualPlayMessage.style.fontSize = "16px";
-    manualPlayModal.appendChild(manualPlayMessage);
-    manualPlayNextBtn = document.createElement("button");
-    manualPlayNextBtn.textContent = "Next Move";
-    manualPlayNextBtn.style.cssText = `background-color: #007bff; color: white; border: none; padding: 10px 15px; border-radius: 5px; cursor: pointer; font-size: 16px; transition: background-color 0.2s;`;
-    manualPlayNextBtn.onmouseover = () => (manualPlayNextBtn.style.backgroundColor = "#0056b3");
-    manualPlayNextBtn.onmouseout = () => (manualPlayNextBtn.style.backgroundColor = "#007bff");
-    manualPlayModal.appendChild(manualPlayNextBtn);
-    document.body.appendChild(manualPlayModal);
-  }
-
-  const showManualPlayModal = (msg) => {
-    if (!manualPlayModal) createManualPlayModal();
-    manualPlayMessage.textContent = msg;
-    manualPlayModal.style.display = "flex";
-  };
-  const hideManualPlayModal = () => manualPlayModal && (manualPlayModal.style.display = "none");
-
-  // --- Overlay and Keyboard Input Functions ---
   function createColumnOverlays(gameArea) {
-    columnOverlays.forEach((overlay) => overlay.remove());
+    columnOverlays.forEach((o) => o.remove());
     columnOverlays = [];
-    const columnLinkCells = getAllElements("center > table > tbody > tr:nth-child(1) > td:nth-child(2) > table > tbody > tr:first-child > td", gameArea);
+
+    const columnLinkCells = getAllElements(
+      "center > table > tbody > tr:nth-child(1) > td:nth-child(2) > table > tbody > tr:first-child > td",
+      gameArea
+    );
     if (columnLinkCells.length === 0) return;
+
     columnLinkCells.forEach((cell, index) => {
       const arrowLink = cell.querySelector("a");
       if (!arrowLink) return;
+
       const linkRect = arrowLink.getBoundingClientRect();
       const bodyRect = document.body.getBoundingClientRect();
+
       const overlay = document.createElement("div");
       overlay.className = "scarab21-column-overlay";
-      overlay.style.cssText = `position: absolute; top: ${linkRect.top - bodyRect.top - 118}px; left: ${linkRect.left - bodyRect.left}px; width: 60px; height: 40px; background-color: #993300; display: flex; justify-content: center; align-items: center; color: white; font-size: 24px; font-weight: bold; pointer-events: none; z-index: ${CONFIG.overlayZIndex}; border: 4px solid transparent; box-sizing: border-box;`;
+      overlay.style.cssText =
+        `position: absolute;` +
+        ` top: ${linkRect.top - bodyRect.top - 118}px;` +
+        ` left: ${linkRect.left - bodyRect.left}px;` +
+        ` width: 60px; height: 40px;` +
+        ` background-color: #993300;` +
+        ` display: flex; justify-content: center; align-items: center;` +
+        ` color: white; font-size: 24px; font-weight: bold;` +
+        ` pointer-events: none;` +
+        ` z-index: ${CONFIG.overlayZIndex};` +
+        ` border: 4px solid transparent; box-sizing: border-box;`;
+
+      const keyChar = Object.keys(CONFIG.keybinds).find((k) => CONFIG.keybinds[k] === index);
+      const label = document.createElement("span");
+      label.textContent = keyChar ? keyChar.replace("Key", "") : "";
+      overlay.appendChild(label);
+
       document.body.appendChild(overlay);
-      const keyLabel = document.createElement("span");
-      const keyChar = Object.keys(CONFIG.keybinds).find((key) => CONFIG.keybinds[key] === index);
-      keyLabel.textContent = keyChar ? keyChar.replace("Key", "") : "";
-      overlay.appendChild(keyLabel);
       columnOverlays.push(overlay);
     });
   }
@@ -180,30 +285,11 @@
   }
 
   function clearOverlayHighlights() {
-    columnOverlays.forEach((overlay) => {
-      overlay.style.borderColor = "transparent";
-    });
+    columnOverlays.forEach((o) => { o.style.borderColor = "transparent"; });
   }
 
-  function handleKeyboardInput(event) {
-    if (!getAutoplaySetting() && window.location.href.includes("scarab21.phtml")) {
-      const chosenColumnIndex0Based = CONFIG.keybinds[event.code];
-      if (chosenColumnIndex0Based !== undefined) {
-        event.preventDefault();
-        const gameArea = getElement(SELECTORS.mainGameWrapper);
-        if (gameArea) {
-          const arrowLink = getElement(SELECTORS.colPlayLinks(chosenColumnIndex0Based + 1), gameArea);
-          if (arrowLink) {
-            hideManualPlayModal();
-            clearOverlayHighlights();
-            arrowLink.click();
-          }
-        }
-      }
-    }
-  }
+  // SELECTORS
 
-  // --- Game Element Selectors ---
   const SELECTORS = {
     mainGameWrapper: ".contentModule .frame > div[style='padding:7px;']",
     playGameButton: "input[value='Play Scarab 21!!!']",
@@ -211,34 +297,45 @@
     collectPointsButton: "div > a > b",
     congratulationsMessage: "center > b:first-child",
     playAgainButton: "input[value='Play Again!']",
-    drawnCardImage: "center > table > tbody > tr > td:first-child > table:nth-of-type(3) > tbody > tr > td:nth-child(2) > img",
-    colPointTexts: "center > table > tbody > tr > td:nth-child(2) > table > tbody > tr:nth-child(3) > td",
-    colPlayLinks: (colIndex) => `center > table > tbody > tr:nth-child(1) > td:nth-child(2) > table > tbody > tr:first-child > td:nth-child(${colIndex}) > a`,
-    columnArrowImage: (colIndex) => `center > table > tbody > tr:nth-child(1) > td:nth-child(2) > table > tbody > tr:first-child > td:nth-child(${colIndex}) > a > img`,
-    cardInColumn: (colIndex) => `center > table > tbody > tr > td:nth-child(2) > table > tbody > tr:nth-child(2) > td:nth-child(${colIndex}) > img`,
-    secondCardInColumn: (colIndex) => `center > table > tbody > tr > td:nth-child(2) > table > tbody > tr:nth-child(2) > td:nth-child(${colIndex}) > img:nth-of-type(2)`,
+    drawnCardImage:
+      "center > table > tbody > tr > td:first-child > table:nth-of-type(3) > tbody > tr > td:nth-child(2) > img",
+    colPointTexts:
+      "center > table > tbody > tr > td:nth-child(2) > table > tbody > tr:nth-child(3) > td",
+    colPlayLinks: (colIndex) =>
+      `center > table > tbody > tr:nth-child(1) > td:nth-child(2) > table > tbody > tr:first-child > td:nth-child(${colIndex}) > a`,
+    cardColumnCell: (colIndex) =>
+      `center > table > tbody > tr > td:nth-child(2) > table > tbody > tr:nth-child(2) > td:nth-child(${colIndex})`,
     errorMessageDiv: "div.errorMessage b",
   };
 
-  // --- Game Logic ---
+  // GAME LOGIC
   async function checkForErrorMessage() {
     const errorBoldText = getElement(SELECTORS.errorMessageDiv);
-    if (errorBoldText && errorBoldText.textContent.includes("Error: ") && errorBoldText.closest("div.errorMessage").textContent.includes("You have been directed to this page from the wrong place!")) {
+    if (
+      errorBoldText &&
+      errorBoldText.textContent.includes("Error: ") &&
+      errorBoldText.closest("div.errorMessage").textContent.includes(
+        "You have been directed to this page from the wrong place!"
+      )
+    ) {
       await goBack();
       return true;
     }
     return false;
   }
 
-  async function handleGameInit(gameArea) {
+  async function handleGameInit() {
     await pauseExecution(CONFIG.initialLoadDelayMs);
     const startBtn = getElement(SELECTORS.playGameButton);
     const abandonBtn = getElement(SELECTORS.cancelGameButton);
+
     if (startBtn) {
       startBtn.click();
       await pauseExecution(getRandomNavigationDelay());
       return true;
-    } else if (abandonBtn) {
+    }
+
+    if (abandonBtn) {
       abandonBtn.click();
       await pauseExecution(getRandomNavigationDelay());
       const retryStartBtn = getElement(SELECTORS.playGameButton);
@@ -246,172 +343,86 @@
         retryStartBtn.click();
         await pauseExecution(getRandomNavigationDelay());
         return true;
-      } else {
-        reloadPage();
-        return false;
       }
-    } else {
-      if (window.location.href.includes("index.phtml")) {
-        reloadPage();
-        return false;
-      }
-      return true;
+      reloadPage();
+      return false;
     }
+
+    if (window.location.href.includes("index.phtml")) {
+      reloadPage();
+      return false;
+    }
+    return true;
   }
 
   async function handleGameCompletion(gameArea) {
-    hideManualPlayModal();
     clearOverlayHighlights();
+
     const collectPointsBtn = getElement(SELECTORS.collectPointsButton, gameArea);
     if (collectPointsBtn && collectPointsBtn.textContent.includes("Collect Points")) {
       collectPointsBtn.closest("a").click();
       await pauseExecution(getRandomNavigationDelay());
       return { action: "continue" };
     }
+
     const congratsMsg = getElement(SELECTORS.congratulationsMessage, gameArea);
     if (congratsMsg && congratsMsg.textContent.includes("Congratulations!!!")) {
       window.location.href = CONFIG.playGameUrl;
       await pauseExecution(getRandomNavigationDelay());
       return { action: "restart" };
     }
+
     const replayBtn = getElement(SELECTORS.playAgainButton);
     if (replayBtn) {
       await pauseExecution(getRandomNavigationDelay());
       replayBtn.click();
       return { action: "restart" };
     }
+
     return { action: "ongoing" };
+  }
+
+  function parseCardFromSrc(src) {
+    const filename = src.substring(src.lastIndexOf("/") + 1, src.lastIndexOf(".gif"));
+    const parts = filename.split("_");
+    if (parts.length < 2) return null;
+
+    const rawToken = parts[0].toLowerCase();
+    const suitToken = parts[1].toLowerCase();
+
+    let raw = 0;
+    if (rawToken === "ace") raw = 14;
+    else raw = parseInt(rawToken, 10);
+    if (Number.isNaN(raw)) return null;
+
+    const rank =
+      rawToken === "ace"   ? "Ace"
+      : rawToken === "jack"  ? "Jack"
+      : rawToken === "queen" ? "Queen"
+      : rawToken === "king"  ? "King"
+      : rawToken;
+
+    const math = raw === 14 ? 1 : raw >= 11 ? 10 : raw;
+    return { raw, math, rank, suit: suitToken, src };
   }
 
   async function getDrawnCardData(gameArea) {
     const cardImg = getElement(SELECTORS.drawnCardImage, gameArea);
     if (!cardImg) return null;
-    const imgSrc = cardImg.getAttribute("src");
-    let rawVal, mathVal;
-    try {
-      const filename = imgSrc.substring(imgSrc.lastIndexOf("/") + 1, imgSrc.lastIndexOf("_"));
-      rawVal = parseInt(filename);
-      if (isNaN(rawVal)) throw new Error("Parsed value is NaN.");
-    } catch (e) {
-      return null;
-    }
-    mathVal = rawVal === 14 ? 11 : [11, 12, 13].includes(rawVal) ? 10 : rawVal;
-    return { raw: rawVal, math: mathVal, src: imgSrc };
+    return parseCardFromSrc(cardImg.getAttribute("src"));
   }
 
-  function getColumnCurrentPoints(gameArea) {
-    const pointEls = getAllElements(SELECTORS.colPointTexts, gameArea);
-    const points = [];
-    pointEls.forEach((el) => points.push(el.textContent.trim()));
-    return points;
-  }
-
-  function determineBestColumn(drawnMathVal, drawnRawVal, drawnCardSrc, currentColumnStates, gameArea) {
-    let bestCol = -1;
-    const parsePoints = (colState) => (typeof colState === "string" && colState.includes("or") ? { A: Number(colState.split(" or ")[0]), B: Number(colState.split(" or ")[1]) } : { A: Number(colState), B: -1 });
-    const colContainsCard = (idx, targetRaw, targetSuit) => Array.from(getAllElements(SELECTORS.cardInColumn(idx + 1), gameArea)).some((img) => img.getAttribute("src").substring(img.getAttribute("src").lastIndexOf("/") + 1, img.getAttribute("src").lastIndexOf(".gif")).includes(`${targetRaw}_${targetSuit}`));
-    const colHasTwoCards = (idx) => elementExists(SELECTORS.secondCardInColumn(idx + 1), gameArea);
-    for (let i = 0; i < currentColumnStates.length; i++) {
-      const { A: colA, B: colB } = parsePoints(currentColumnStates[i]);
-      const col1Based = i + 1;
-      if (drawnMathVal + colA === 21 || (colB !== -1 && drawnMathVal + colB === 21)) {
-        bestCol = col1Based;
-        break;
-      }
-      if (drawnRawVal === 14) {
-        if (colA === 10 || colB === 10) {
-          if (colContainsCard(i, 11, "spades") && drawnCardSrc.includes("14_spades")) {
-            bestCol = col1Based;
-            break;
-          }
-          if (!colHasTwoCards(i)) {
-            bestCol = col1Based;
-          } else if (bestCol === -1) {
-            bestCol = col1Based;
-          }
-        } else if (colA === 20 || colB === 20) {
-          bestCol = col1Based;
-          break;
-        }
-      } else if (drawnMathVal === 10) {
-        if (colA === 11 || colB === 11) {
-          if (colContainsCard(i, 14, "spades") && drawnCardSrc.includes("11_spades")) {
-            bestCol = col1Based;
-            break;
-          }
-          if (!colHasTwoCards(i)) {
-            bestCol = col1Based;
-            break;
-          } else {
-            bestCol = col1Based;
-            break;
-          }
-        } else if (colA === 0) {
-          bestCol = col1Based;
-        }
-      }
-      if (bestCol === -1 && (drawnMathVal + colA === 11 || (colB !== -1 && drawnMathVal + colB === 11))) {
-        bestCol = col1Based;
-      }
+  function collectBoardState(gameArea) {
+    const board = [];
+    for (let col = 1; col <= 5; col++) {
+      const cell = getElement(SELECTORS.cardColumnCell(col), gameArea);
+      if (!cell) { board.push([]); continue; }
+      const cards = Array.from(cell.querySelectorAll("img"))
+        .map((img) => parseCardFromSrc(img.getAttribute("src")))
+        .filter(Boolean);
+      board.push(cards);
     }
-    if (bestCol !== -1) return bestCol;
-    let fallbackCol = -1,
-      kSum = 10000;
-    let effDrawnVal = drawnMathVal === 11 ? 1 : drawnMathVal;
-    for (let i = 0; i < currentColumnStates.length; i++) {
-      const { A: colA, B: colB } = parsePoints(currentColumnStates[i]);
-      const col1Based = i + 1;
-      const potSums = [];
-      if (colA + effDrawnVal <= 21) potSums.push(colA + effDrawnVal);
-      if (colB !== -1 && colB + effDrawnVal <= 21) potSums.push(colB + effDrawnVal);
-      if (potSums.length > 0) {
-        const currSum = Math.min(...potSums);
-        if (colA === 0 && drawnRawVal === 14) {
-          fallbackCol = col1Based;
-          break;
-        }
-        if (currSum < kSum && colA !== 0 && colA !== 1) {
-          if (colA === 10 && !colHasTwoCards(i)) continue;
-          if (colA === 11 && currentColumnStates[i].includes("or")) continue;
-          kSum = currSum;
-          fallbackCol = col1Based;
-        }
-      }
-    }
-    if (fallbackCol !== -1) return fallbackCol;
-    kSum = 10000;
-    for (let i = 0; i < currentColumnStates.length; i++) {
-      const { A: colA, B: colB } = parsePoints(currentColumnStates[i]);
-      const col1Based = i + 1;
-      effDrawnVal = drawnMathVal === 11 ? 1 : drawnMathVal;
-      const potSums = [];
-      if (colA + effDrawnVal <= 21) potSums.push(colA + effDrawnVal);
-      if (colB !== -1 && colB + effDrawnVal <= 21) potSums.push(colB + effDrawnVal);
-      if (potSums.length > 0) {
-        const currSum = Math.min(...potSums);
-        if (currSum < kSum && colA !== 1) {
-          if (colA === 10 && !colHasTwoCards(i)) continue;
-          if (colA === 0 && drawnMathVal === 10) {
-            kSum = currSum;
-            fallbackCol = col1Based;
-            break;
-          }
-          kSum = currSum;
-          fallbackCol = col1Based;
-        }
-      }
-    }
-    if (fallbackCol !== -1) return fallbackCol;
-    for (let i = 0; i < currentColumnStates.length; i++) {
-      const { A: colA, B: colB } = parsePoints(currentColumnStates[i]);
-      const col1Based = i + 1;
-      effDrawnVal = drawnMathVal === 11 ? 1 : drawnMathVal;
-      if (colA + effDrawnVal <= 21 || (colB !== -1 && colB + effDrawnVal <= 21)) {
-        fallbackCol = col1Based;
-        break;
-      }
-    }
-    return fallbackCol;
+    return board;
   }
 
   async function executeCardPlacement(chosenCol, gameArea) {
@@ -425,63 +436,55 @@
     }
   }
 
-  // --- Main Logic ---
+  // MAIN AUTOPLAYER LOOP
   async function initializeAutoplayer() {
-    createAutoplayToggleButton();
-    createManualPlayModal();
     if (await checkForErrorMessage()) return;
+
     if (window.location.href.includes("index.phtml")) {
-      const initiated = await handleGameInit(document);
+      const initiated = await handleGameInit();
       if (!initiated) return;
     }
-    let mainGameWrapper = getElement(SELECTORS.mainGameWrapper);
+
+    const mainGameWrapper = getElement(SELECTORS.mainGameWrapper);
     if (!mainGameWrapper) {
       reloadPage();
       return;
     }
+
     createColumnOverlays(mainGameWrapper);
-    document.addEventListener("keydown", handleKeyboardInput);
+
     while (true) {
       clearOverlayHighlights();
+
       const gameStatus = await handleGameCompletion(mainGameWrapper);
       if (gameStatus.action !== "ongoing") return;
+
       const cardData = await getDrawnCardData(mainGameWrapper);
       if (!cardData) {
         reloadPage();
         return;
       }
-      const colPoints = getColumnCurrentPoints(mainGameWrapper);
-      if (colPoints.length !== 5) {
+
+      const boardState = collectBoardState(mainGameWrapper);
+
+      // Run the decision engine synchronously in-page (no server needed)
+      const chosenCol = chooseColumn(cardData, boardState);
+
+      if (chosenCol < 1 || chosenCol > 5) {
+        // No legal move - should be extremely rare; reload to recover
+        console.warn("Scarab21: no legal column found, reloading.");
         reloadPage();
         return;
       }
-      const chosenCol = determineBestColumn(cardData.math, cardData.raw, cardData.src, colPoints, mainGameWrapper);
-      if (chosenCol === -1) {
-        reloadPage();
-        return;
-      }
+
       highlightOverlay(chosenCol);
-      if (getAutoplaySetting()) {
-        hideManualPlayModal();
-        await pauseExecution(getRandomDelay());
-        await executeCardPlacement(chosenCol, mainGameWrapper);
-        return;
-      } else {
-        const columnDisplay = chosenCol;
-        showManualPlayModal(`Place ${cardData.raw} (${cardData.math}) in Col ${columnDisplay}.`);
-        await new Promise((resolve) => {
-          manualPlayNextBtn.onclick = async () => {
-            hideManualPlayModal();
-            await executeCardPlacement(chosenCol, mainGameWrapper);
-            resolve();
-          };
-        });
-        return;
-      }
+      await pauseExecution(getRandomDelay());
+      await executeCardPlacement(chosenCol, mainGameWrapper);
+      return;
     }
   }
 
-  // --- Script Initialization ---
+  // BOOTSTRAP
   let isScriptRunning = false;
   function startScript() {
     if (isScriptRunning) return;
